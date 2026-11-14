@@ -1,0 +1,125 @@
+
+name: Update PacBrew Repository
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pacbrew-repository-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout my repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check upstream for updates
+        id: upstream
+        shell: bash
+        run: |
+          UPSTREAM_SHA=$(git ls-remote \
+            https://github.com/ps4-homebrew-dev/pacbrew.git \
+            refs/heads/master | cut -f1)
+
+          if [ -z "$UPSTREAM_SHA" ]; then
+            echo "Could not retrieve upstream commit"
+            exit 1
+          fi
+
+          git fetch origin gh-pages
+
+          PREVIOUS_SHA=$(git show \
+            origin/gh-pages:.upstream-commit 2>/dev/null || true)
+
+          echo "Upstream: $UPSTREAM_SHA"
+          echo "Published: $PREVIOUS_SHA"
+
+          echo "$UPSTREAM_SHA" > upstream.sha
+
+          if [ "$UPSTREAM_SHA" = "$PREVIOUS_SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout upstream source
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          git clone \
+            https://github.com/ps4-homebrew-dev/pacbrew.git \
+            upstream
+
+          cd upstream
+          git checkout "$(cat ../upstream.sha)"
+
+      - name: Install build dependencies
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          sudo apt update
+
+          sudo apt install -y \
+            cmake pkg-config meson clang-20 lld-20 \
+            llvm-20-dev libclang-20-dev libclang-cpp20-dev \
+            libclc-20-dev libllvmspirvlib-20-dev \
+            build-essential autoconf libtool yasm nasm \
+            bison flex smpq gperf pkgconf libarchive-tools \
+            autopoint po4a git curl doxygen \
+            makepkg pacman-package-manager \
+            python3-mako python3-glad \
+            spirv-tools glslang-tools python3-packaging
+
+          sudo python3 -m pip install \
+            --break-system-packages 'meson>=1.4.0'
+
+      - name: Build all packages
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          cd upstream
+          bash ci-libs.sh
+
+      - name: Prepare repository
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          mkdir -p public
+
+          find upstream -type f \
+            -name 'ps4-homebrew-*.pkg.tar.gz' \
+            -exec cp -v -t public {} +
+
+          if ! compgen -G 'public/*.pkg.tar.gz' >/dev/null; then
+            echo "No packages were generated!"
+            exit 1
+          fi
+
+          echo "Packages collected:"
+          ls -lh public/
+
+      - name: Generate Pacman database
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          cd public
+
+          repo-add pacbrew.db.tar.gz \
+            ./*.pkg.tar.gz
+
+          echo "$(cat ../upstream.sha)" > .upstream-commit
+
+      - name: Publish to my GitHub repository
+        if: steps.upstream.outputs.changed == 'true'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: public
+          force_orphan: true
